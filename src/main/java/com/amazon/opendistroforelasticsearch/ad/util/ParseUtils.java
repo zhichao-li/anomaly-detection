@@ -35,6 +35,7 @@ import org.elasticsearch.common.xcontent.XContentType;
 import org.elasticsearch.index.query.BoolQueryBuilder;
 import org.elasticsearch.index.query.QueryBuilders;
 import org.elasticsearch.index.query.RangeQueryBuilder;
+import org.elasticsearch.index.query.TermQueryBuilder;
 import org.elasticsearch.search.aggregations.AggregationBuilder;
 import org.elasticsearch.search.aggregations.AggregatorFactories;
 import org.elasticsearch.search.aggregations.BaseAggregationBuilder;
@@ -340,5 +341,34 @@ public final class ParseUtils {
         }
 
         return internalSearchSourceBuilder.toString();
+    }
+
+    public static SearchSourceBuilder generateEntityColdStartQuery(
+        AnomalyDetector detector,
+        List<Entry<Long, Long>> ranges,
+        String entityName,
+        NamedXContentRegistry xContentRegistry
+    ) throws IOException {
+
+        TermQueryBuilder term = new TermQueryBuilder(detector.getEntityByField().get(0), entityName);
+        BoolQueryBuilder internalFilterQuery = QueryBuilders.boolQuery().filter(detector.getFilterQuery()).filter(term);
+
+        DateRangeAggregationBuilder dateRangeBuilder = dateRange("date_range").field(detector.getTimeField()).format("epoch_millis");
+        for (Entry<Long, Long> range : ranges) {
+            dateRangeBuilder.addRange(range.getKey(), range.getValue());
+        }
+
+        if (detector.getFeatureAttributes() != null) {
+            for (Feature feature : detector.getFeatureAttributes()) {
+                AggregatorFactories.Builder internalAgg = parseAggregators(
+                    feature.getAggregation().toString(),
+                    xContentRegistry,
+                    feature.getId()
+                );
+                dateRangeBuilder.subAggregation(internalAgg.getAggregatorFactories().iterator().next());
+            }
+        }
+
+        return new SearchSourceBuilder().query(internalFilterQuery).size(0).aggregation(dateRangeBuilder);
     }
 }

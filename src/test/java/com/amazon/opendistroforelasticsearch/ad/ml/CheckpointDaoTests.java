@@ -45,14 +45,22 @@ import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.client.Client;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
 import org.mockito.Answers;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Matchers;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
+import org.powermock.api.mockito.PowerMockito;
+import org.powermock.core.classloader.annotations.PrepareForTest;
+import org.powermock.modules.junit4.PowerMockRunner;
 
 import com.amazon.opendistroforelasticsearch.ad.util.ClientUtil;
+import com.amazon.randomcutforest.serialize.RandomCutForestSerDe;
+import com.google.gson.Gson;
 
+@RunWith(PowerMockRunner.class)
+@PrepareForTest({ Gson.class })
 public class CheckpointDaoTests {
 
     private CheckpointDao checkpointDao;
@@ -67,6 +75,9 @@ public class CheckpointDaoTests {
     @Mock
     private GetResponse getResponse;
 
+    @Mock
+    private RandomCutForestSerDe rcfSerde;
+
     // configuration
     private String indexName;
 
@@ -75,13 +86,20 @@ public class CheckpointDaoTests {
     private String model;
     private Map<String, Object> docSource;
 
+    private Gson gson;
+    private Class<? extends ThresholdingModel> thresholdingModelClass;
+
     @Before
     public void setup() {
         MockitoAnnotations.initMocks(this);
 
         indexName = "testIndexName";
 
-        checkpointDao = new CheckpointDao(client, clientUtil, indexName);
+        gson = PowerMockito.mock(Gson.class);
+
+        thresholdingModelClass = HybridThresholdingModel.class;
+
+        checkpointDao = new CheckpointDao(client, clientUtil, indexName, gson, rcfSerde, thresholdingModelClass);
 
         modelId = "testModelId";
         model = "testModel";

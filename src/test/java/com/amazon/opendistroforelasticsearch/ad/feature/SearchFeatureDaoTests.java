@@ -19,6 +19,7 @@ import static java.util.Arrays.asList;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyLong;
 import static org.mockito.Matchers.anyObject;
@@ -40,6 +41,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
 import java.util.function.BiConsumer;
 
 import junitparams.JUnitParamsRunner;
@@ -71,6 +73,7 @@ import org.elasticsearch.search.aggregations.metrics.Max;
 import org.elasticsearch.search.aggregations.metrics.NumericMetricsAggregation;
 import org.elasticsearch.search.aggregations.metrics.Percentile;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.threadpool.ThreadPool;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -84,12 +87,13 @@ import org.powermock.core.classloader.annotations.PrepareForTest;
 import org.powermock.modules.junit4.PowerMockRunner;
 import org.powermock.modules.junit4.PowerMockRunnerDelegate;
 
+import com.amazon.opendistroforelasticsearch.ad.AnomalyDetectorPlugin;
+import com.amazon.opendistroforelasticsearch.ad.NodeStateManager;
 import com.amazon.opendistroforelasticsearch.ad.dataprocessor.Interpolator;
 import com.amazon.opendistroforelasticsearch.ad.dataprocessor.LinearUniformInterpolator;
 import com.amazon.opendistroforelasticsearch.ad.dataprocessor.SingleFeatureLinearUniformInterpolator;
 import com.amazon.opendistroforelasticsearch.ad.model.AnomalyDetector;
 import com.amazon.opendistroforelasticsearch.ad.model.IntervalTimeConfiguration;
-import com.amazon.opendistroforelasticsearch.ad.transport.TransportStateManager;
 import com.amazon.opendistroforelasticsearch.ad.util.ClientUtil;
 import com.amazon.opendistroforelasticsearch.ad.util.ParseUtils;
 
@@ -128,10 +132,13 @@ public class SearchFeatureDaoTests {
     @Mock
     private Max max;
     @Mock
-    private TransportStateManager stateManager;
+    private NodeStateManager stateManager;
 
     @Mock
     private AnomalyDetector detector;
+
+    @Mock
+    private ThreadPool threadPool;
 
     private SearchSourceBuilder featureQuery = new SearchSourceBuilder();
     private Map<String, Object> searchRequestParams;
@@ -148,7 +155,16 @@ public class SearchFeatureDaoTests {
         PowerMockito.mockStatic(ParseUtils.class);
 
         Interpolator interpolator = new LinearUniformInterpolator(new SingleFeatureLinearUniformInterpolator());
-        searchFeatureDao = spy(new SearchFeatureDao(client, xContent, interpolator, clientUtil));
+
+        ExecutorService executorService = mock(ExecutorService.class);
+        when(threadPool.executor(AnomalyDetectorPlugin.AD_THREAD_POOL_NAME)).thenReturn(executorService);
+        doAnswer(invocation -> {
+            Runnable runnable = invocation.getArgument(0);
+            runnable.run();
+            return null;
+        }).when(executorService).execute(any(Runnable.class));
+
+        searchFeatureDao = spy(new SearchFeatureDao(client, xContent, interpolator, clientUtil, threadPool));
 
         detectionInterval = new IntervalTimeConfiguration(1, ChronoUnit.MINUTES);
         when(detector.getTimeField()).thenReturn("testTimeField");

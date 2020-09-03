@@ -45,6 +45,8 @@ import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.ThreadedActionListener;
 import org.elasticsearch.threadpool.ThreadPool;
 
+import com.amazon.opendistroforelasticsearch.ad.AnomalyDetectorPlugin;
+import com.amazon.opendistroforelasticsearch.ad.NodeStateManager;
 import com.amazon.opendistroforelasticsearch.ad.common.exception.EndRunException;
 import com.amazon.opendistroforelasticsearch.ad.constant.CommonErrorMessages;
 import com.amazon.opendistroforelasticsearch.ad.dataprocessor.Interpolator;
@@ -76,6 +78,7 @@ public class FeatureManager {
     private final Duration featureBufferTtl;
     private final ThreadPool threadPool;
     private final String adThreadPoolName;
+    private NodeStateManager stateManager;
 
     /**
      * Constructor with dependencies and configuration.
@@ -93,6 +96,8 @@ public class FeatureManager {
      * @param maxPreviewSamples max number of samples from search for preview features
      * @param featureBufferTtl time to live for stale feature buffers
      * @param threadPool object through which we can invoke different threadpool using different names
+     * @param adThreadPoolName ad threadpool's name
+     * @param stateManager accessor to nodes' AD states
      */
     public FeatureManager(
         SearchFeatureDao searchFeatureDao,
@@ -108,7 +113,8 @@ public class FeatureManager {
         int maxPreviewSamples,
         Duration featureBufferTtl,
         ThreadPool threadPool,
-        String adThreadPoolName
+        String adThreadPoolName,
+        NodeStateManager stateManager
     ) {
         this.searchFeatureDao = searchFeatureDao;
         this.interpolator = interpolator;
@@ -126,6 +132,7 @@ public class FeatureManager {
         this.detectorIdsToTimeShingles = new ConcurrentHashMap<>();
         this.threadPool = threadPool;
         this.adThreadPoolName = adThreadPoolName;
+        this.stateManager = stateManager;
     }
 
     /**
@@ -536,6 +543,28 @@ public class FeatureManager {
         return new SimpleImmutableEntry<>(sampleRanges, stride);
     }
 
+    private List<Entry<Long, Long>> getSampleRanges(
+        AnomalyDetector detector,
+        long startMilli,
+        long endMilli,
+        int stride,
+        int maxTrainSamples
+    ) {
+        long bucketSize = ((IntervalTimeConfiguration) detector.getDetectionInterval()).toDuration().toMillis();
+        int numBuckets = (int) Math.floor((endMilli - startMilli) / (double) bucketSize);
+        int numStrides = (int) Math.ceil(numBuckets / (double) stride);
+        if (maxTrainSamples - 1 < numStrides) {
+            numStrides = maxTrainSamples - 1;
+            startMilli = endMilli - bucketSize * stride * numStrides;
+        }
+        List<Entry<Long, Long>> sampleRanges = Stream
+            .iterate(endMilli, i -> i - stride * bucketSize)
+            .limit(numStrides + 1)
+            .map(time -> new SimpleImmutableEntry<>(time - bucketSize, time))
+            .collect(Collectors.toList());
+        return sampleRanges;
+    }
+
     /**
      * Gets search results for the sampled time ranges.
      *
@@ -625,5 +654,116 @@ public class FeatureManager {
         } else {
             return -1;
         }
+    }
+
+    public void getEntityColdStartData(
+        String detectorId,
+        String entityName,
+        int entityShingleSize,
+        ActionListener<Optional<List<double[][]>>> listener
+    ) {
+        ActionListener<Optional<AnomalyDetector>> getDetectorListener = ActionListener.wrap(detectorOp -> {
+            if (!detectorOp.isPresent()) {
+                listener.onFailure(new EndRunException(detectorId, "AnomalyDetector is not available.", true));
+                return;
+            }
+            List<double[][]> coldStartData = new ArrayList<>();
+            AnomalyDetector detector = detectorOp.get();
+
+            ActionListener<Entry<Optional<Long>, Optional<Long>>> minMaxTimeListener = ActionListener.wrap(minMaxDateTime -> {
+                Optional<Long> earliest = minMaxDateTime.getKey();
+                Optional<Long> latest = minMaxDateTime.getValue();
+                if (earliest.isPresent() && latest.isPresent()) {
+                    long startTimeMs = earliest.get().longValue();
+                    long endTimeMs = latest.get().longValue();
+                    List<Entry<Long, Long>> sampleRanges = getSampleRanges(
+                        detector,
+                        startTimeMs,
+                        endTimeMs,
+                        maxSampleStride,
+                        maxTrainSamples
+                    );
+
+                    ActionListener<List<Optional<double[]>>> getFeaturelistener = ActionListener.wrap(featureSamples -> {
+                        ArrayList<double[]> continuousSampledFeatures = new ArrayList<>(maxTrainSamples);
+
+                        // featuresSamples are in ascending order of time.
+                        for (int i = 0; i < featureSamples.size(); i++) {
+                            Optional<double[]> featuresOptional = featureSamples.get(i);
+                            if (featuresOptional.isPresent()) {
+                                continuousSampledFeatures.add(featuresOptional.get());
+                            } else if (!continuousSampledFeatures.isEmpty()) {
+                                double[][] continuousSampledArray = continuousSampledFeatures.toArray(new double[0][0]);
+                                double[][] points = transpose(
+                                    interpolator
+                                        .interpolate(
+                                            transpose(continuousSampledArray),
+                                            maxSampleStride * (continuousSampledArray.length - 1) + 1
+                                        )
+                                );
+                                coldStartData.add(batchShingle(points, entityShingleSize));
+                                continuousSampledFeatures.clear();
+                            }
+                        }
+                        if (!continuousSampledFeatures.isEmpty()) {
+                            double[][] continuousSampledArray = continuousSampledFeatures.toArray(new double[0][0]);
+                            double[][] points = transpose(
+                                interpolator
+                                    .interpolate(
+                                        transpose(continuousSampledArray),
+                                        maxSampleStride * (continuousSampledArray.length - 1) + 1
+                                    )
+                            );
+                            coldStartData.add(batchShingle(points, entityShingleSize));
+                        }
+                        if (coldStartData.isEmpty()) {
+                            listener.onResponse(Optional.empty());
+                        } else {
+                            listener.onResponse(Optional.of(coldStartData));
+                        }
+                    }, listener::onFailure);
+
+                    searchFeatureDao
+                        .getColdStartSamplesForPeriods(
+                            detector,
+                            sampleRanges,
+                            entityName,
+                            new ThreadedActionListener<>(
+                                logger,
+                                threadPool,
+                                AnomalyDetectorPlugin.AD_THREAD_POOL_NAME,
+                                getFeaturelistener,
+                                false
+                            )
+                        );
+                } else {
+                    listener.onResponse(Optional.empty());
+                }
+
+            }, listener::onFailure);
+
+            searchFeatureDao
+                .getEntityMinMaxDataTime(
+                    detector,
+                    entityName,
+                    new ThreadedActionListener<>(logger, threadPool, AnomalyDetectorPlugin.AD_THREAD_POOL_NAME, minMaxTimeListener, false)
+                );
+
+        }, listener::onFailure);
+
+        stateManager
+            .getAnomalyDetector(
+                detectorId,
+                new ThreadedActionListener<>(logger, threadPool, AnomalyDetectorPlugin.AD_THREAD_POOL_NAME, getDetectorListener, false)
+            );
+    }
+
+    public void getFeaturesByEntities(
+        AnomalyDetector detector,
+        long startMilli,
+        long endMilli,
+        ActionListener<Map<String, double[]>> listener
+    ) {
+        searchFeatureDao.getFeaturesByEntities(detector, startMilli, endMilli, listener);
     }
 }

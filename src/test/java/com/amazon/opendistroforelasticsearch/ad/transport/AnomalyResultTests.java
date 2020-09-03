@@ -103,6 +103,7 @@ import test.com.amazon.opendistroforelasticsearch.ad.util.JsonDeserializer;
 
 import com.amazon.opendistroforelasticsearch.ad.AbstractADTest;
 import com.amazon.opendistroforelasticsearch.ad.AnomalyDetectorPlugin;
+import com.amazon.opendistroforelasticsearch.ad.NodeStateManager;
 import com.amazon.opendistroforelasticsearch.ad.TestHelpers;
 import com.amazon.opendistroforelasticsearch.ad.breaker.ADCircuitBreakerService;
 import com.amazon.opendistroforelasticsearch.ad.cluster.HashRing;
@@ -138,7 +139,7 @@ public class AnomalyResultTests extends AbstractADTest {
     private static Settings settings = Settings.EMPTY;
     private TransportService transportService;
     private ClusterService clusterService;
-    private TransportStateManager stateManager;
+    private NodeStateManager stateManager;
     private FeatureManager featureQuery;
     private ModelManager normalModelManager;
     private Client client;
@@ -174,7 +175,7 @@ public class AnomalyResultTests extends AbstractADTest {
 
         transportService = testNodes[0].transportService;
         clusterService = testNodes[0].clusterService;
-        stateManager = mock(TransportStateManager.class);
+        stateManager = mock(NodeStateManager.class);
         // return 2 RCF partitions
         partitionNum = 2;
         when(stateManager.getPartitionNumber(any(String.class), any(AnomalyDetector.class))).thenReturn(partitionNum);
@@ -191,6 +192,7 @@ public class AnomalyResultTests extends AbstractADTest {
         when(detector.getIndices()).thenReturn(userIndex);
         adID = "123";
         when(detector.getDetectorId()).thenReturn(adID);
+        when(detector.getEntityByField()).thenReturn(null);
         // when(detector.getDetectorId()).thenReturn("testDetectorId");
         doAnswer(invocation -> {
             ActionListener<Optional<AnomalyDetector>> listener = invocation.getArgument(1);
@@ -209,19 +211,20 @@ public class AnomalyResultTests extends AbstractADTest {
             return null;
         }).when(featureQuery).getCurrentFeatures(any(AnomalyDetector.class), anyLong(), anyLong(), any(ActionListener.class));
 
+        double rcfScore = 0.2;
         normalModelManager = mock(ModelManager.class);
         doAnswer(invocation -> {
-            ActionListener<ThresholdingResult> listener = invocation.getArgument(3);
-            listener.onResponse(new ThresholdingResult(0, 1.0d));
-            return null;
-        }).when(normalModelManager).getThresholdingResult(any(String.class), any(String.class), anyDouble(), any(ActionListener.class));
-
-        doAnswer(invocation -> {
             ActionListener<RcfResult> listener = invocation.getArgument(3);
-            listener.onResponse(new RcfResult(0.2, 0, 100));
+            listener.onResponse(new RcfResult(rcfScore, 0, 100));
             return null;
         }).when(normalModelManager).getRcfResult(any(String.class), any(String.class), any(double[].class), any(ActionListener.class));
         when(normalModelManager.combineRcfResults(any())).thenReturn(new CombinedRcfResult(0, 1.0d));
+
+        doAnswer(invocation -> {
+            ActionListener<ThresholdingResult> listener = invocation.getArgument(3);
+            listener.onResponse(new ThresholdingResult(0, 1.0d, rcfScore));
+            return null;
+        }).when(normalModelManager).getThresholdingResult(any(String.class), any(String.class), anyDouble(), any(ActionListener.class));
 
         rcfModelID = "123-rcf-1";
         when(normalModelManager.getRcfModelId(any(String.class), anyInt())).thenReturn(rcfModelID);
@@ -786,7 +789,7 @@ public class AnomalyResultTests extends AbstractADTest {
 
     @SuppressWarnings("unchecked")
     public void testMute() {
-        TransportStateManager muteStateManager = mock(TransportStateManager.class);
+        NodeStateManager muteStateManager = mock(NodeStateManager.class);
         when(muteStateManager.isMuted(any(String.class))).thenReturn(true);
         doAnswer(invocation -> {
             ActionListener<Optional<AnomalyDetector>> listener = invocation.getArgument(1);

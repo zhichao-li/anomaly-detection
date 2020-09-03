@@ -61,13 +61,13 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
 import com.amazon.opendistroforelasticsearch.ad.AnomalyDetectorPlugin;
+import com.amazon.opendistroforelasticsearch.ad.NodeStateManager;
 import com.amazon.opendistroforelasticsearch.ad.common.exception.EndRunException;
 import com.amazon.opendistroforelasticsearch.ad.dataprocessor.Interpolator;
 import com.amazon.opendistroforelasticsearch.ad.dataprocessor.LinearUniformInterpolator;
 import com.amazon.opendistroforelasticsearch.ad.dataprocessor.SingleFeatureLinearUniformInterpolator;
 import com.amazon.opendistroforelasticsearch.ad.model.AnomalyDetector;
 import com.amazon.opendistroforelasticsearch.ad.model.IntervalTimeConfiguration;
-import com.amazon.opendistroforelasticsearch.ad.transport.TransportStateManager;
 import com.amazon.opendistroforelasticsearch.ad.util.ArrayEqMatcher;
 
 @RunWith(JUnitParamsRunner.class)
@@ -100,7 +100,7 @@ public class FeatureManagerTests {
     private Clock clock;
 
     @Mock
-    private TransportStateManager stateManager;
+    private NodeStateManager stateManager;
 
     @Mock
     private ThreadPool threadPool;
@@ -154,7 +154,8 @@ public class FeatureManagerTests {
                 maxPreviewSamples,
                 featureBufferTtl,
                 threadPool,
-                AnomalyDetectorPlugin.AD_THREAD_POOL_NAME
+                AnomalyDetectorPlugin.AD_THREAD_POOL_NAME,
+                stateManager
             )
         );
     }
@@ -247,7 +248,8 @@ public class FeatureManagerTests {
                 maxPreviewSamples,
                 featureBufferTtl,
                 threadPool,
-                AnomalyDetectorPlugin.AD_THREAD_POOL_NAME
+                AnomalyDetectorPlugin.AD_THREAD_POOL_NAME,
+                stateManager
             )
         );
         featureManager.getColdStartData(detector, listener);

@@ -23,7 +23,10 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.AbstractMap.SimpleImmutableEntry;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -31,8 +34,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -43,17 +48,24 @@ import java.util.stream.Stream;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.bulk.BulkRequest;
+import org.elasticsearch.action.support.ThreadedActionListener;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.monitor.jvm.JvmService;
+import org.elasticsearch.threadpool.ThreadPool;
 
+import com.amazon.opendistroforelasticsearch.ad.AnomalyDetectorPlugin;
 import com.amazon.opendistroforelasticsearch.ad.common.exception.LimitExceededException;
 import com.amazon.opendistroforelasticsearch.ad.common.exception.ResourceNotFoundException;
 import com.amazon.opendistroforelasticsearch.ad.constant.CommonErrorMessages;
+import com.amazon.opendistroforelasticsearch.ad.feature.FeatureManager;
 import com.amazon.opendistroforelasticsearch.ad.ml.rcf.CombinedRcfResult;
 import com.amazon.opendistroforelasticsearch.ad.model.AnomalyDetector;
 import com.amazon.opendistroforelasticsearch.ad.util.DiscoveryNodeFilterer;
 import com.amazon.randomcutforest.RandomCutForest;
 import com.amazon.randomcutforest.serialize.RandomCutForestSerDe;
+import com.google.common.util.concurrent.RateLimiter;
 import com.google.gson.Gson;
 
 /**
@@ -64,10 +76,14 @@ public class ModelManager {
     protected static final String DETECTOR_ID_PATTERN = "(.*)_model_.+";
     protected static final String RCF_MODEL_ID_PATTERN = "%s_model_rcf_%d";
     protected static final String THRESHOLD_MODEL_ID_PATTERN = "%s_model_threshold";
+    protected static final String ENTITY_SAMPLE = "sp";
+    protected static final String ENTITY_RCF = "rcf";
+    protected static final String ENTITY_THRESHOLD = "th";
 
     public enum ModelType {
         RCF("rcf"),
-        THRESHOLD("threshold");
+        THRESHOLD("threshold"),
+        ENTITY("entity");
 
         private String name;
 
@@ -87,6 +103,7 @@ public class ModelManager {
     // states
     private Map<String, ModelState<RandomCutForest>> forests;
     private Map<String, ModelState<ThresholdingModel>> thresholds;
+    private Map<String, ModelState<EntityModel>> entityModels = new ConcurrentHashMap<>();
 
     // configuration
     private final double modelDesiredSizePercentage;
@@ -106,6 +123,15 @@ public class ModelManager {
     private final Duration modelTtl;
     private final Duration checkpointInterval;
 
+    private final int numBufferSize = 128;
+    // Kaituo: changed from 4 to 1. Otherwise, our code is wrong as we take the last 4 points in
+    // the buffer and predict without honoring the uniform spacing assumption
+    private final int numEntityDataPoints = 1;
+    private final int numEntityRcfSample = 256;
+    private final int numEntityRcfTree = 10;
+    private final double maxEntityRank = 0.001;
+    private final int maxEntityModels = 1000;
+
     // dependencies
     private final DiscoveryNodeFilterer nodeFilter;
     private final JvmService jvmService;
@@ -113,6 +139,11 @@ public class ModelManager {
     private final CheckpointDao checkpointDao;
     private final Gson gson;
     private final Clock clock;
+    public FeatureManager featureManager;
+    private final ThreadPool threadPool;
+    private Instant lastThrottledColdStartTime;
+    private Map<String, ModelStateMeta> modelStateMeta;
+    private RateLimiter limiter;
 
     // A tree of N samples has 2N nodes, with one bounding box for each node.
     private static final long BOUNDING_BOXES = 2L;
@@ -145,6 +176,7 @@ public class ModelManager {
      * @param modelTtl time to live for hosted models
      * @param checkpointInterval interval between checkpoints
      * @param clusterService cluster service object
+     * @param threadPool accessor to different threadpools
      */
     public ModelManager(
         DiscoveryNodeFilterer nodeFilter,
@@ -169,7 +201,8 @@ public class ModelManager {
         int minPreviewSize,
         Duration modelTtl,
         Duration checkpointInterval,
-        ClusterService clusterService
+        ClusterService clusterService,
+        ThreadPool threadPool
     ) {
 
         this.nodeFilter = nodeFilter;
@@ -199,6 +232,10 @@ public class ModelManager {
         this.thresholds = new ConcurrentHashMap<>();
 
         clusterService.getClusterSettings().addSettingsUpdateConsumer(MODEL_MAX_SIZE_PERCENTAGE, it -> this.modelMaxSizePercentage = it);
+        this.threadPool = threadPool;
+        this.lastThrottledColdStartTime = Instant.MIN;
+        this.modelStateMeta = new ConcurrentHashMap<>();
+        this.limiter = RateLimiter.create(0.25);
     }
 
     /**
@@ -466,7 +503,7 @@ public class ModelManager {
         double confidence = threshold.confidence();
         threshold.update(score);
         modelState.setLastUsedTime(clock.instant());
-        return new ThresholdingResult(grade, confidence);
+        return new ThresholdingResult(grade, confidence, score);
     }
 
     /**
@@ -506,7 +543,7 @@ public class ModelManager {
             threshold.update(score);
         }
         modelState.setLastUsedTime(clock.instant());
-        listener.onResponse(new ThresholdingResult(grade, confidence));
+        listener.onResponse(new ThresholdingResult(grade, confidence, score));
     }
 
     private void processThresholdCheckpoint(
@@ -1024,7 +1061,7 @@ public class ModelManager {
         return Arrays.stream(dataPoints).map(point -> {
             double rcfScore = forest.getAnomalyScore(point);
             forest.update(point);
-            ThresholdingResult result = new ThresholdingResult(threshold.grade(rcfScore), threshold.confidence());
+            ThresholdingResult result = new ThresholdingResult(threshold.grade(rcfScore), threshold.confidence(), rcfScore);
             threshold.update(rcfScore);
             return result;
         }).collect(Collectors.toList());
@@ -1084,5 +1121,323 @@ public class ModelManager {
                 );
         }
 
+    }
+
+    private void processEntityCheckpoint(
+        Optional<EntityModel> checkpoint,
+        String detectorId,
+        String modelId,
+        double[] datapoint,
+        String entityName
+    ) {
+        EntityModel model = null;
+        if (checkpoint.isPresent()) {
+            model = checkpoint.get();
+        } else {
+            model = new EntityModel(modelId, new ArrayDeque<>(), null, null);
+        }
+
+        model.getSamples().add(datapoint);
+
+        ModelState<EntityModel> modelState = new ModelState<>(model, modelId, detectorId, ModelType.ENTITY.getName(), clock.instant());
+        entityModels.put(modelId, modelState);
+
+        RandomCutForest rcf = model.getRcf();
+        ThresholdingModel threshold = model.getThreshold();
+        Queue<double[]> samples = model.getSamples();
+        ModelStateMeta meta = modelStateMeta.computeIfAbsent(entityName, k -> new ModelStateMeta());
+        ThresholdingResult result = null;
+        if (rcf == null || threshold == null) {
+            result = trainModel(samples, meta, modelId, entityName, detectorId, modelState, datapoint);
+        }
+
+        if (model.getRcf() != null && model.getThreshold() != null && result == null) {
+            result = score(samples, meta, modelState);
+        }
+    }
+
+    public ThresholdingResult getAnomalyResultForEntity(String detectorId, double[] datapoint, String entityMapping) {
+        ThresholdingResult result = null;
+        // entityMapping is like {host=server_1}
+        // TODO: separate out during result parsing
+        String modelId = detectorId + entityMapping;
+        final String entityName;
+        // terms aggregation does not have =
+        if (entityMapping.contains("=")) {
+            String entityNamePar = entityMapping.split("=")[1].trim();
+            entityName = entityNamePar.substring(0, entityNamePar.length() - 1);
+        } else {
+            entityName = entityMapping;
+        }
+
+        ModelState<EntityModel> modelState = entityModels.get(modelId);
+        logger.debug("model state of {}: {}", modelId, modelState);
+        if (modelState != null) {
+            EntityModel model = modelState.getModel();
+            Queue<double[]> samples = model.getSamples();
+            samples.add(datapoint);
+            // kaituo: we want the most recent 2000 samples. Changed from 2000 to 128
+            if (samples.size() > this.numBufferSize) {
+                samples.remove();
+            }
+
+            ModelStateMeta meta = modelStateMeta.computeIfAbsent(entityName, k -> new ModelStateMeta());
+
+            // kaituo: we should infer whenever both models are not null and do cold start if model is not there
+            RandomCutForest rcf = model.getRcf();
+            ThresholdingModel threshold = model.getThreshold();
+            logger.debug("model state of {}: {} and {} and {}", modelId, rcf, threshold, samples.size());
+            if (rcf == null || threshold == null) {
+                result = trainModel(samples, meta, modelId, entityName, detectorId, modelState, datapoint);
+            }
+
+            if (model.getRcf() != null && model.getThreshold() != null && result == null) {
+                result = score(samples, meta, modelState);
+            }
+        } else {
+            result = new ThresholdingResult(0, 0, 0);
+            // kaituo: this can cause thrashing as we can constantly swap models in and out
+            checkpointDao
+                .restoreModelCheckpoint(
+                    modelId,
+                    ActionListener
+                        .wrap(
+                            checkpoint -> processEntityCheckpoint(checkpoint, detectorId, modelId, datapoint, entityName),
+                            e -> { processEntityCheckpoint(Optional.empty(), detectorId, modelId, datapoint, entityName); }
+                        )
+                );
+        }
+
+        if (entityModels.size() > maxEntityModels) {
+            Instant expireTime = entityModels
+                .values()
+                .stream()
+                .map(ModelState::getLastUsedTime)
+                .sorted(Comparator.reverseOrder())
+                .limit(maxEntityModels - 20)
+                .min(Comparator.naturalOrder())
+                .orElse(clock.instant());
+
+            BulkRequest bulkRequest = new BulkRequest();
+            entityModels.entrySet().forEach(e -> {
+                if (e.getValue().getLastUsedTime().isBefore(expireTime)) {
+                    checkpointDao.prepareBulk(bulkRequest, e.getValue().getModel(), modelId);
+                }
+            });
+            entityModels.entrySet().removeIf(e -> e.getValue().getLastUsedTime().isBefore(expireTime));
+            checkpointDao.bulk(bulkRequest);
+        }
+
+        return result;
+    }
+
+    private ThresholdingResult score(Queue<double[]> samples, ModelStateMeta meta, ModelState<EntityModel> modelState) {
+        // double[][] sampleArray = samples.toArray(new double[0][0]);
+        // double[] feature = this.featureManager.batchShingle(Arrays.copyOfRange(sampleArray,
+        // sampleArray.length - this.numEntityDataPoints, sampleArray.length),
+        // this.numEntityDataPoints)[0];
+        EntityModel model = modelState.getModel();
+        RandomCutForest rcf = model.getRcf();
+        ThresholdingModel threshold = model.getThreshold();
+
+        double lastRcfScore = 0;
+        while (samples.peek() != null) {
+            double[] feature = samples.poll();
+            lastRcfScore = rcf.getAnomalyScore(feature);
+            rcf.update(feature);
+            threshold.update(lastRcfScore);
+        }
+
+        double anomalyGrade = threshold.grade(lastRcfScore);
+        double anomalyConfidence = computeRcfConfidence(rcf) * threshold.confidence();
+        ThresholdingResult result = new ThresholdingResult(anomalyGrade, anomalyConfidence, lastRcfScore);
+
+        if (!meta.initialized && lastRcfScore > 0) {
+            logger
+                .info(
+                    "Preparing entity {} takes {} seconds",
+                    modelState.getModelId(),
+                    Duration.between(meta.createdTime, clock.instant()).getSeconds()
+                );
+            meta.initialized = true;
+        }
+
+        modelState.setLastUsedTime(clock.instant());
+        return result;
+    }
+
+    private ThresholdingResult trainModel(
+        Queue<double[]> samples,
+        ModelStateMeta meta,
+        String modelId,
+        String entityName,
+        String detectorId,
+        ModelState<EntityModel> modelState,
+        double[] datapoint
+    ) {
+        ThresholdingResult result = null;
+        if (samples.size() < this.numEntityRcfSample / 2) {
+            result = new ThresholdingResult(0, 0, 0);
+            coldStart(meta, modelId, entityName, detectorId, modelState);
+        } else {
+            EntityModel model = modelState.getModel();
+            logger.debug("Trigger training for {}", modelId);
+            RandomCutForest rcf = RandomCutForest
+                .builder()
+                .randomSeed(0L)
+                .dimensions(this.numEntityDataPoints * datapoint.length)
+                .sampleSize(this.numEntityRcfSample)
+                .numberOfTrees(this.numEntityRcfTree)
+                .lambda(this.rcfTimeDecay)
+                .outputAfter(this.numEntityRcfSample / 2)
+                .parallelExecutionEnabled(false)
+                .build();
+            model.setRcf(rcf);
+            ThresholdingModel threshold = new HybridThresholdingModel(
+                0.999,
+                this.maxEntityRank,
+                this.thresholdMaxScore,
+                this.thresholdNumLogNormalQuantiles,
+                this.thresholdDownsamples,
+                this.thresholdMaxSamples
+            );
+            model.setThreshold(threshold);
+            double[][] trainData = this.featureManager.batchShingle(samples.toArray(new double[0][0]), this.numEntityDataPoints);
+            final RandomCutForest frcf = rcf;
+            Arrays.stream(trainData).forEach(p -> frcf.update(p));
+            double[] scores = Arrays.stream(trainData).mapToDouble(p -> frcf.getAnomalyScore(p)).toArray();
+            threshold.train(scores);
+        }
+        return result;
+    }
+
+    private void coldStart(ModelStateMeta meta, String modelId, String entityName, String detectorId, ModelState<EntityModel> modelState) {
+        // kaituo: won't retry cold start within one hour for an entity; if threadpool queue full, won't retry within 5 minutes
+        // if ((meta.lastColdStartTime.plus(Duration.ofHours(1)).isBefore(clock.instant()))
+        // && lastThrottledColdStartTime.plus(Duration.ofMinutes(5)).isBefore(clock.instant())) {
+        if (meta.lastColdStartTime.plus(Duration.ofHours(1)).isBefore(clock.instant())
+            && lastThrottledColdStartTime.plus(Duration.ofMinutes(5)).isBefore(clock.instant())
+            && limiter.tryAcquire()) {
+            logger.debug("Trigger cold start for {}", modelId);
+
+            // substring to remove the last }
+            // globalRunner.compute(new EntityColdStartJob(detectorId, modelId, entityName.substring(0, entityName.length()-1),
+            // modelState, this.numEntityDataPoints, limiter));
+
+            ActionListener<Optional<List<double[][]>>> nestedListener = ActionListener.wrap(trainingData -> {
+                logger.debug("EntityColdStartJob2 " + trainingData);
+                if (trainingData.isPresent()) {
+                    List<double[][]> dataPoints = trainingData.get();
+                    for (int i = 0; i < dataPoints.size(); i++) {
+                        double[][] contDataPoints = dataPoints.get(i);
+                        logger.debug("EntityColdStartJob3 " + Arrays.deepToString(contDataPoints));
+                        logger.debug("EntityColdStartJob9 " + contDataPoints.length);
+                    }
+                    trainModel(dataPoints, modelId, modelState);
+                    logger.info("Succeeded in training entity: {}", modelId);
+                } else {
+                    logger.info("Cannot get training data for {}", modelId);
+                }
+            }, exception -> {
+                if (exception instanceof EsRejectedExecutionException || exception instanceof RejectedExecutionException) {
+                    logger.info("too many requests");
+                    lastThrottledColdStartTime = Instant.now();
+                } else {
+                    logger.error("Error while cold start", exception);
+                }
+            });
+
+            threadPool
+                .executor(AnomalyDetectorPlugin.AD_THREAD_POOL_NAME)
+                .execute(
+                    () -> featureManager
+                        .getEntityColdStartData(
+                            detectorId,
+                            entityName,
+                            this.numEntityDataPoints,
+                            new ThreadedActionListener<>(
+                                logger,
+                                threadPool,
+                                AnomalyDetectorPlugin.AD_THREAD_POOL_NAME,
+                                nestedListener,
+                                false
+                            )
+                        )
+                );
+
+            meta.lastColdStartTime = Instant.now();
+        }
+    }
+
+    public void trainModel(List<double[][]> dataPoints, String modelId, ModelState<EntityModel> entityState) {
+        if (dataPoints == null || dataPoints.size() == 0 || dataPoints.get(0).length == 0) {
+            throw new IllegalArgumentException("Data points must not be empty.");
+        }
+
+        int rcfNumFeatures = dataPoints.get(0)[0].length;
+        logger.debug("EntityColdStartJob6 " + rcfNumFeatures);
+        RandomCutForest rcf = RandomCutForest
+            .builder()
+            .dimensions(rcfNumFeatures)
+            .sampleSize(this.numEntityRcfSample)
+            .numberOfTrees(this.numEntityRcfTree)
+            .lambda(rcfTimeDecay)
+            .outputAfter(this.numEntityRcfSample / 2)
+            .parallelExecutionEnabled(false)
+            .build();
+        List<double[]> allScores = new ArrayList<>();
+        int totalLength = 0;
+        logger.debug("EntityColdStartJob8 " + dataPoints.size());
+        for (double[][] continuousDataPoints : dataPoints) {
+            logger.debug("EntityColdStartJob11 " + continuousDataPoints.length);
+            double[] scores = trainContinuousModel(continuousDataPoints, modelId, rcf);
+            allScores.add(scores);
+            totalLength += scores.length;
+        }
+
+        EntityModel model = entityState.getModel();
+        assert (model != null);
+        model.setRcf(rcf);
+        logger.debug("EntityColdStartJob4 " + rcf);
+        double[] joinedScores = new double[totalLength];
+
+        int destStart = 0;
+        for (double[] scores : allScores) {
+            System.arraycopy(scores, 0, joinedScores, destStart, scores.length);
+            destStart += scores.length;
+        }
+
+        // Train thresholding model
+        ThresholdingModel threshold = new HybridThresholdingModel(
+            thresholdMinPvalue,
+            thresholdMaxRankError,
+            thresholdMaxScore,
+            thresholdNumLogNormalQuantiles,
+            thresholdDownsamples,
+            thresholdMaxSamples
+        );
+        threshold.train(joinedScores);
+        model.setThreshold(threshold);
+        logger.debug("EntityColdStartJob5 " + threshold);
+
+        entityState.setLastUsedTime(clock.instant());
+    }
+
+    public double[] trainContinuousModel(double[][] dataPoints, String modelId, RandomCutForest rcf) {
+        if (dataPoints.length == 0 || dataPoints[0].length == 0) {
+            throw new IllegalArgumentException("Data points must not be empty.");
+        }
+
+        logger.debug("EntityColdStartJob12 " + dataPoints.length);
+        double[] scores = new double[dataPoints.length];
+        Arrays.fill(scores, 0.);
+
+        for (int j = 0; j < dataPoints.length; j++) {
+            logger.debug("EntityColdStartJob6 " + Arrays.toString(dataPoints[j]));
+            scores[j] = rcf.getAnomalyScore(dataPoints[j]);
+            rcf.update(dataPoints[j]);
+        }
+
+        return DoubleStream.of(scores).filter(score -> score > 0).toArray();
     }
 }

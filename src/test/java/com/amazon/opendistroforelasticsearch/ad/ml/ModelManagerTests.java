@@ -19,6 +19,7 @@ import static java.util.Arrays.asList;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyObject;
 import static org.mockito.Matchers.eq;
@@ -43,6 +44,7 @@ import java.util.List;
 import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -56,6 +58,7 @@ import org.elasticsearch.common.collect.ImmutableOpenMap;
 import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.monitor.jvm.JvmService;
+import org.elasticsearch.threadpool.ThreadPool;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -69,6 +72,7 @@ import org.powermock.core.classloader.annotations.PrepareForTest;
 import org.powermock.modules.junit4.PowerMockRunner;
 import org.powermock.modules.junit4.PowerMockRunnerDelegate;
 
+import com.amazon.opendistroforelasticsearch.ad.AnomalyDetectorPlugin;
 import com.amazon.opendistroforelasticsearch.ad.common.exception.LimitExceededException;
 import com.amazon.opendistroforelasticsearch.ad.common.exception.ResourceNotFoundException;
 import com.amazon.opendistroforelasticsearch.ad.ml.rcf.CombinedRcfResult;
@@ -130,6 +134,9 @@ public class ModelManagerTests {
     @Mock
     private HybridThresholdingModel hybridThresholdingModel;
 
+    @Mock
+    private ThreadPool threadPool;
+
     private String detectorId;
     private String modelId;
     private String rcfModelId;
@@ -175,6 +182,14 @@ public class ModelManagerTests {
 
         clusterService = new ClusterService(settings, clusterSettings, null);
 
+        ExecutorService executorService = mock(ExecutorService.class);
+        when(threadPool.executor(AnomalyDetectorPlugin.AD_THREAD_POOL_NAME)).thenReturn(executorService);
+        doAnswer(invocation -> {
+            Runnable runnable = invocation.getArgument(0);
+            runnable.run();
+            return null;
+        }).when(executorService).execute(any(Runnable.class));
+
         modelManager = spy(
             new ModelManager(
                 nodeFilter,
@@ -199,7 +214,8 @@ public class ModelManagerTests {
                 minPreviewSize,
                 modelTtl,
                 checkpointInterval,
-                clusterService
+                clusterService,
+                threadPool
             )
         );
 
@@ -462,7 +478,7 @@ public class ModelManagerTests {
 
         ThresholdingResult result = modelManager.getThresholdingResult(detectorId, modelId, score);
 
-        ThresholdingResult expected = new ThresholdingResult(grade, confidence);
+        ThresholdingResult expected = new ThresholdingResult(grade, confidence, score);
         assertEquals(expected, result);
 
         result = modelManager.getThresholdingResult(detectorId, modelId, score);
@@ -496,7 +512,7 @@ public class ModelManagerTests {
         ActionListener<ThresholdingResult> listener = mock(ActionListener.class);
         modelManager.getThresholdingResult(detectorId, thresholdModelId, score, listener);
 
-        ThresholdingResult expected = new ThresholdingResult(grade, confidence);
+        ThresholdingResult expected = new ThresholdingResult(grade, confidence, score);
         verify(listener).onResponse(eq(expected));
 
         listener = mock(ActionListener.class);

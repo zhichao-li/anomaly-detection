@@ -15,8 +15,12 @@
 
 package com.amazon.opendistroforelasticsearch.ad.ml;
 
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
+import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -24,6 +28,9 @@ import java.util.Optional;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.bulk.BulkAction;
+import org.elasticsearch.action.bulk.BulkRequest;
+import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.delete.DeleteRequest;
 import org.elasticsearch.action.delete.DeleteResponse;
 import org.elasticsearch.action.get.GetRequest;
@@ -33,6 +40,11 @@ import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.client.Client;
 
 import com.amazon.opendistroforelasticsearch.ad.util.ClientUtil;
+import com.amazon.randomcutforest.RandomCutForest;
+import com.amazon.randomcutforest.serialize.RandomCutForestSerDe;
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 /**
  * DAO for model checkpoints.
@@ -42,6 +54,9 @@ public class CheckpointDao {
     protected static final String DOC_TYPE = "_doc";
     protected static final String FIELD_MODEL = "model";
     public static final String TIMESTAMP = "timestamp";
+    protected static final String ENTITY_SAMPLE = "sp";
+    protected static final String ENTITY_RCF = "rcf";
+    protected static final String ENTITY_THRESHOLD = "th";
 
     private static final Logger logger = LogManager.getLogger(CheckpointDao.class);
 
@@ -52,17 +67,34 @@ public class CheckpointDao {
     // configuration
     private final String indexName;
 
+    private Gson gson;
+    private RandomCutForestSerDe rcfSerde;
+    private final Class<? extends ThresholdingModel> thresholdingModelClass;
+
     /**
      * Constructor with dependencies and configuration.
      *
      * @param client ES search client
      * @param clientUtil utility with ES client
      * @param indexName name of the index for model checkpoints
+     * @param gson accessor to Gson functionality
+     * @param rcfSerde accessor to rcf serialization/deserialization
+     * @param thresholdingModelClass thresholding model's class
      */
-    public CheckpointDao(Client client, ClientUtil clientUtil, String indexName) {
+    public CheckpointDao(
+        Client client,
+        ClientUtil clientUtil,
+        String indexName,
+        Gson gson,
+        RandomCutForestSerDe rcfSerde,
+        Class<? extends ThresholdingModel> thresholdingModelClass
+    ) {
         this.client = client;
         this.clientUtil = clientUtil;
         this.indexName = indexName;
+        this.gson = gson;
+        this.rcfSerde = rcfSerde;
+        this.thresholdingModelClass = thresholdingModelClass;
     }
 
     /**
@@ -106,6 +138,26 @@ public class CheckpointDao {
             );
     }
 
+    public void bulk(BulkRequest bulkRequest) {
+        // TODO: add retry logic
+        // It is possible other concurrent save has already depleted toSave
+        if (bulkRequest.numberOfActions() > 0) {
+            clientUtil
+                .<BulkRequest, BulkResponse>execute(
+                    BulkAction.INSTANCE,
+                    bulkRequest,
+                    ActionListener
+                        .wrap(r -> logger.debug("Succeeded in bulking checkpoints"), e -> logger.error("Failed bulking checkpoints", e))
+                );
+        }
+    }
+
+    public void prepareBulk(BulkRequest bulkRequest, EntityModel modelState, String modelId) {
+        Map<String, Object> source = new HashMap<>();
+        source.put(FIELD_MODEL, toCheckpoint(modelState));
+        bulkRequest.add(new IndexRequest(indexName, DOC_TYPE, modelId).source(source));
+    }
+
     /**
      * Returns the checkpoint for the model.
      *
@@ -144,6 +196,59 @@ public class CheckpointDao {
             .filter(GetResponse::isExists)
             .map(GetResponse::getSource)
             .map(source -> (String) source.get(FIELD_MODEL));
+    }
+
+    public void restoreModelCheckpoint(String modelId, ActionListener<Optional<EntityModel>> listener) {
+        clientUtil
+            .<GetRequest, GetResponse>asyncRequest(
+                new GetRequest(indexName, DOC_TYPE, modelId),
+                client::get,
+                ActionListener.wrap(response -> {
+                    Optional<String> checkpointString = processModelCheckpoint(response);
+                    if (checkpointString.isPresent()) {
+                        listener.onResponse(Optional.of(fromEntityModelCheckpoint(checkpointString.get(), modelId)));
+                    } else {
+                        listener.onResponse(Optional.empty());
+                    }
+                }, listener::onFailure)
+            );
+    }
+
+    private String toCheckpoint(EntityModel model) {
+        return AccessController.doPrivileged((PrivilegedAction<String>) () -> {
+            JsonObject json = new JsonObject();
+            json.add(ENTITY_SAMPLE, gson.toJsonTree(model.getSamples()));
+            if (model.getRcf() != null) {
+                json.addProperty(ENTITY_RCF, rcfSerde.toJson(model.getRcf()));
+            }
+            if (model.getThreshold() != null) {
+                json.addProperty(ENTITY_THRESHOLD, gson.toJson(model.getThreshold()));
+            }
+            return gson.toJson(json);
+        });
+    }
+
+    private EntityModel fromEntityModelCheckpoint(String checkpoint, String modelId) {
+        try {
+            return AccessController.doPrivileged((PrivilegedAction<EntityModel>) () -> {
+                JsonObject json = new JsonParser().parse(checkpoint).getAsJsonObject();
+                ArrayDeque<double[]> samples = new ArrayDeque<>(
+                    Arrays.asList(this.gson.fromJson(json.getAsJsonArray(ENTITY_SAMPLE), new double[0][0].getClass()))
+                );
+                RandomCutForest rcf = null;
+                if (json.has(ENTITY_RCF)) {
+                    rcf = rcfSerde.fromJson(json.getAsJsonPrimitive(ENTITY_RCF).getAsString());
+                }
+                ThresholdingModel threshold = null;
+                if (json.has(ENTITY_THRESHOLD)) {
+                    threshold = this.gson.fromJson(json.getAsJsonPrimitive(ENTITY_THRESHOLD).getAsString(), thresholdingModelClass);
+                }
+                return new EntityModel(modelId, samples, rcf, threshold);
+            });
+        } catch (RuntimeException e) {
+            logger.warn("from", e);
+            throw e;
+        }
     }
 
     /**

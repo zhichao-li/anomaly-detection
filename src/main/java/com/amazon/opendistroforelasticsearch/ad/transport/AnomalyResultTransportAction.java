@@ -18,9 +18,11 @@ package com.amazon.opendistroforelasticsearch.ad.transport;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -48,11 +50,13 @@ import org.elasticsearch.node.NodeClosedException;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.ConnectTransportException;
+import org.elasticsearch.transport.EmptyTransportResponseHandler;
 import org.elasticsearch.transport.ReceiveTimeoutTransportException;
 import org.elasticsearch.transport.TransportRequestOptions;
 import org.elasticsearch.transport.TransportService;
 
 import com.amazon.opendistroforelasticsearch.ad.AnomalyDetectorPlugin;
+import com.amazon.opendistroforelasticsearch.ad.NodeStateManager;
 import com.amazon.opendistroforelasticsearch.ad.breaker.ADCircuitBreakerService;
 import com.amazon.opendistroforelasticsearch.ad.cluster.HashRing;
 import com.amazon.opendistroforelasticsearch.ad.common.exception.AnomalyDetectionException;
@@ -93,7 +97,7 @@ public class AnomalyResultTransportAction extends HandledTransportAction<ActionR
     static final String BUG_RESPONSE = "We might have bugs.";
 
     private final TransportService transportService;
-    private final TransportStateManager stateManager;
+    private final NodeStateManager stateManager;
     private final FeatureManager featureManager;
     private final ModelManager modelManager;
     private final HashRing hashRing;
@@ -109,7 +113,7 @@ public class AnomalyResultTransportAction extends HandledTransportAction<ActionR
         ActionFilters actionFilters,
         TransportService transportService,
         Settings settings,
-        TransportStateManager manager,
+        NodeStateManager manager,
         FeatureManager featureManager,
         ModelManager modelManager,
         HashRing hashRing,
@@ -241,6 +245,40 @@ public class AnomalyResultTransportAction extends HandledTransportAction<ActionR
             }
             AnomalyDetector anomalyDetector = detector.get();
 
+            long delayMillis = Optional
+                .ofNullable((IntervalTimeConfiguration) anomalyDetector.getWindowDelay())
+                .map(t -> t.toDuration().toMillis())
+                .orElse(0L);
+            long dataStartTime = request.getStart() - delayMillis;
+            long dataEndTime = request.getEnd() - delayMillis;
+
+            List<String> detectorByField = anomalyDetector.getEntityByField();
+            if (detectorByField != null) {
+                featureManager.getFeaturesByEntities(anomalyDetector, dataStartTime, dataEndTime, ActionListener.wrap(entityFeatures -> {
+                    entityFeatures
+                        .entrySet()
+                        .stream()
+                        .collect(
+                            Collectors
+                                .groupingBy(e -> hashRing.getOwningNode(e.getKey()).get(), Collectors.toMap(Entry::getKey, Entry::getValue))
+                        )
+                        .entrySet()
+                        .stream()
+                        .forEach(
+                            nodeEntity -> transportService
+                                .sendRequest(
+                                    nodeEntity.getKey(),
+                                    EntityResultAction.NAME,
+                                    new EntityResultRequest(adID, nodeEntity.getValue(), dataStartTime, dataEndTime),
+                                    this.option,
+                                    new EmptyTransportResponseHandler(AnomalyDetectorPlugin.AD_THREAD_POOL_NAME)
+                                )
+                        );
+                    listener.onResponse(new AnomalyResultResponse(0, 0, 0, new ArrayList<FeatureData>()));
+                }, listener::onFailure));
+                return;
+            }
+
             String thresholdModelID = modelManager.getThresholdModelId(adID);
             Optional<DiscoveryNode> asThresholdNode = hashRing.getOwningNode(thresholdModelID);
             if (!asThresholdNode.isPresent()) {
@@ -253,13 +291,6 @@ public class AnomalyResultTransportAction extends HandledTransportAction<ActionR
             if (!shouldStart(listener, adID, anomalyDetector, thresholdNode.getId(), thresholdModelID)) {
                 return;
             }
-
-            long delayMillis = Optional
-                .ofNullable((IntervalTimeConfiguration) anomalyDetector.getWindowDelay())
-                .map(t -> t.toDuration().toMillis())
-                .orElse(0L);
-            long dataStartTime = request.getStart() - delayMillis;
-            long dataEndTime = request.getEnd() - delayMillis;
 
             featureManager
                 .getCurrentFeatures(

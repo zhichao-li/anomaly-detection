@@ -193,7 +193,8 @@ public class TestHelpers {
             randomIntBetween(1, 2000),
             uiMetadata,
             randomInt(),
-            lastUpdateTime
+            lastUpdateTime,
+            null
         );
     }
 
@@ -212,7 +213,8 @@ public class TestHelpers {
             randomIntBetween(1, 2000),
             null,
             randomInt(),
-            Instant.now()
+            Instant.now(),
+            null
         );
     }
 
@@ -231,7 +233,8 @@ public class TestHelpers {
             randomIntBetween(1, 2000),
             null,
             randomInt(),
-            Instant.now().truncatedTo(ChronoUnit.SECONDS)
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            null
         );
     }
 
@@ -250,7 +253,8 @@ public class TestHelpers {
             randomIntBetween(1, 2000),
             null,
             randomInt(),
-            Instant.now().truncatedTo(ChronoUnit.SECONDS)
+            Instant.now().truncatedTo(ChronoUnit.SECONDS),
+            null
         );
     }
 

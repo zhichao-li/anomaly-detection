@@ -20,6 +20,7 @@ import static java.util.Collections.unmodifiableList;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -36,6 +37,7 @@ import org.elasticsearch.client.Client;
 import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.inject.Module;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
 import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.IndexScopedSettings;
@@ -107,6 +109,8 @@ import com.amazon.opendistroforelasticsearch.ad.transport.CronAction;
 import com.amazon.opendistroforelasticsearch.ad.transport.CronTransportAction;
 import com.amazon.opendistroforelasticsearch.ad.transport.DeleteModelAction;
 import com.amazon.opendistroforelasticsearch.ad.transport.DeleteModelTransportAction;
+import com.amazon.opendistroforelasticsearch.ad.transport.EntityResultAction;
+import com.amazon.opendistroforelasticsearch.ad.transport.EntityResultTransportAction;
 import com.amazon.opendistroforelasticsearch.ad.transport.ProfileAction;
 import com.amazon.opendistroforelasticsearch.ad.transport.ProfileTransportAction;
 import com.amazon.opendistroforelasticsearch.ad.transport.RCFPollingAction;
@@ -117,9 +121,8 @@ import com.amazon.opendistroforelasticsearch.ad.transport.StopDetectorAction;
 import com.amazon.opendistroforelasticsearch.ad.transport.StopDetectorTransportAction;
 import com.amazon.opendistroforelasticsearch.ad.transport.ThresholdResultAction;
 import com.amazon.opendistroforelasticsearch.ad.transport.ThresholdResultTransportAction;
-import com.amazon.opendistroforelasticsearch.ad.transport.TransportStateManager;
-import com.amazon.opendistroforelasticsearch.ad.transport.handler.AnomalyIndexHandler;
 import com.amazon.opendistroforelasticsearch.ad.transport.handler.DetectionStateHandler;
+import com.amazon.opendistroforelasticsearch.ad.transport.handler.ResultHandler;
 import com.amazon.opendistroforelasticsearch.ad.util.ClientUtil;
 import com.amazon.opendistroforelasticsearch.ad.util.DiscoveryNodeFilterer;
 import com.amazon.opendistroforelasticsearch.ad.util.IndexUtils;
@@ -154,6 +157,7 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
     private DiscoveryNodeFilterer nodeFilter;
     private IndexUtils indexUtils;
     private DetectionStateHandler detectorStateHandler;
+    private ResultHandler anomalyResultHandler;
 
     static {
         SpecialPermission.check();
@@ -174,21 +178,6 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<DiscoveryNodes> nodesInCluster
     ) {
-
-        AnomalyIndexHandler<AnomalyResult> anomalyResultHandler;
-        anomalyResultHandler = new AnomalyIndexHandler<AnomalyResult>(
-            client,
-            settings,
-            threadPool,
-            AnomalyResult.ANOMALY_RESULT_INDEX,
-            ThrowingConsumerWrapper.throwingConsumerWrapper(anomalyDetectionIndices::initAnomalyResultIndexDirectly),
-            anomalyDetectionIndices::doesAnomalyResultIndexExist,
-            false,
-            this.clientUtil,
-            this.indexUtils,
-            clusterService
-        );
-
         AnomalyDetectorJobRunner jobRunner = AnomalyDetectorJobRunner.getJobRunnerInstance();
         jobRunner.setClient(client);
         jobRunner.setClientUtil(clientUtil);
@@ -264,8 +253,7 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
         this.client = client;
         this.threadPool = threadPool;
         Settings settings = environment.settings();
-        Clock clock = Clock.systemUTC();
-        Throttler throttler = new Throttler(clock);
+        Throttler throttler = new Throttler(getClock());
         this.clientUtil = new ClientUtil(settings, client, throttler, threadPool);
         this.indexUtils = new IndexUtils(client, clientUtil, clusterService, indexNameExpressionResolver);
         anomalyDetectionIndices = new AnomalyDetectionIndices(client, clusterService, threadPool, settings);
@@ -275,11 +263,18 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
         SingleFeatureLinearUniformInterpolator singleFeatureLinearUniformInterpolator =
             new IntegerSensitiveSingleFeatureLinearUniformInterpolator();
         Interpolator interpolator = new LinearUniformInterpolator(singleFeatureLinearUniformInterpolator);
-        SearchFeatureDao searchFeatureDao = new SearchFeatureDao(client, xContentRegistry, interpolator, clientUtil);
+        SearchFeatureDao searchFeatureDao = new SearchFeatureDao(client, xContentRegistry, interpolator, clientUtil, threadPool);
 
         JvmService jvmService = new JvmService(environment.settings());
         RandomCutForestSerDe rcfSerde = new RandomCutForestSerDe();
-        CheckpointDao checkpoint = new CheckpointDao(client, clientUtil, CommonName.CHECKPOINT_INDEX_NAME);
+        CheckpointDao checkpoint = new CheckpointDao(
+            client,
+            clientUtil,
+            CommonName.CHECKPOINT_INDEX_NAME,
+            gson,
+            rcfSerde,
+            HybridThresholdingModel.class
+        );
 
         this.nodeFilter = new DiscoveryNodeFilterer(this.clusterService);
 
@@ -289,7 +284,7 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
             rcfSerde,
             checkpoint,
             gson,
-            clock,
+            getClock(),
             AnomalyDetectorSettings.DESIRED_MODEL_SIZE_PERCENTAGE,
             AnomalyDetectorSettings.MODEL_MAX_SIZE_PERCENTAGE.get(settings),
             AnomalyDetectorSettings.NUM_TREES,
@@ -306,23 +301,24 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
             AnomalyDetectorSettings.MIN_PREVIEW_SIZE,
             AnomalyDetectorSettings.HOURLY_MAINTENANCE,
             AnomalyDetectorSettings.HOURLY_MAINTENANCE,
-            clusterService
+            clusterService,
+            threadPool
         );
 
-        HashRing hashRing = new HashRing(nodeFilter, clock, settings);
-        TransportStateManager stateManager = new TransportStateManager(
+        HashRing hashRing = new HashRing(nodeFilter, getClock(), settings);
+        NodeStateManager stateManager = new NodeStateManager(
             client,
             xContentRegistry,
             modelManager,
             settings,
             clientUtil,
-            clock,
+            getClock(),
             AnomalyDetectorSettings.HOURLY_MAINTENANCE
         );
         FeatureManager featureManager = new FeatureManager(
             searchFeatureDao,
             interpolator,
-            clock,
+            getClock(),
             AnomalyDetectorSettings.MAX_TRAIN_SAMPLE,
             AnomalyDetectorSettings.MAX_SAMPLE_STRIDE,
             AnomalyDetectorSettings.TRAIN_SAMPLE_TIME_RANGE_IN_HOURS,
@@ -333,8 +329,10 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
             AnomalyDetectorSettings.MAX_PREVIEW_SAMPLES,
             AnomalyDetectorSettings.HOURLY_MAINTENANCE,
             threadPool,
-            AD_THREAD_POOL_NAME
+            AD_THREAD_POOL_NAME,
+            stateManager
         );
+        modelManager.featureManager = featureManager;
         anomalyDetectorRunner = new AnomalyDetectorRunner(modelManager, featureManager, AnomalyDetectorSettings.MAX_PREVIEW_RESULTS);
 
         Map<String, ADStat<?>> stats = ImmutableMap
@@ -372,6 +370,16 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
             stateManager
         );
 
+        anomalyResultHandler = new ResultHandler(
+            client,
+            settings,
+            threadPool,
+            anomalyDetectionIndices,
+            this.clientUtil,
+            this.indexUtils,
+            clusterService
+        );
+
         return ImmutableList
             .of(
                 anomalyDetectionIndices,
@@ -384,15 +392,31 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
                 hashRing,
                 featureManager,
                 modelManager,
-                clock,
                 stateManager,
                 new ADClusterEventListener(clusterService, hashRing, modelManager, nodeFilter),
                 adCircuitBreakerService,
                 adStats,
-                new MasterEventListener(clusterService, threadPool, client, clock, clientUtil, nodeFilter),
+                new MasterEventListener(clusterService, threadPool, client, getClock(), clientUtil, nodeFilter),
                 nodeFilter,
-                detectorStateHandler
+                detectorStateHandler,
+                anomalyResultHandler
             );
+    }
+
+    /**
+     * createComponents doesn't work for Clock as ES cannot start complaining cannot find Clock instances.
+     * @return a UTC clock
+     */
+    protected Clock getClock() {
+        return Clock.systemUTC();
+    }
+
+    @Override
+    public Collection<Module> createGuiceModules() {
+        List<Module> modules = new ArrayList<>();
+        modules.add(b -> b.bind(Clock.class).toInstance(getClock()));
+
+        return modules;
     }
 
     @Override
@@ -460,7 +484,8 @@ public class AnomalyDetectorPlugin extends Plugin implements ActionPlugin, Scrip
                 new ActionHandler<>(CronAction.INSTANCE, CronTransportAction.class),
                 new ActionHandler<>(ADStatsNodesAction.INSTANCE, ADStatsNodesTransportAction.class),
                 new ActionHandler<>(ProfileAction.INSTANCE, ProfileTransportAction.class),
-                new ActionHandler<>(RCFPollingAction.INSTANCE, RCFPollingTransportAction.class)
+                new ActionHandler<>(RCFPollingAction.INSTANCE, RCFPollingTransportAction.class),
+                new ActionHandler<>(EntityResultAction.INSTANCE, EntityResultTransportAction.class)
             );
     }
 
